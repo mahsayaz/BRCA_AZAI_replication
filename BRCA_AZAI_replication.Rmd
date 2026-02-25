@@ -1,0 +1,1295 @@
+---
+title: "Replication of AZ-AI Late Fusion Pipeline (TCGA-BRCA)"
+author: "Mahsa Yazdani"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+# AZ-AI late-fusion replication in TCGA-BRCA
+
+This notebook reproduces a simplified version of the *AZ-AI late-fusion* survival benchmarking workflow on **TCGA-BRCA**, with a focus on:
+
+- patient-level preprocessing and leakage-aware feature handling  
+- unimodal model selection (clinical vs RNA)  
+- late fusion (validation-weighted risk-score averaging)  
+- 5-fold cross-validation + simple statistical comparisons  
+- calibration proxy at a **5-year** horizon
+
+**Practical notes**
+- TCGA clinical fields can be incomplete; survival time is defined using `days_to_death` (events) and `days_to_last_followup` (censored).
+
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+set.seed(123)
+
+# --- Folders ---
+dir.create("data/raw", recursive = TRUE, showWarnings = FALSE)
+dir.create("data/processed", recursive = TRUE, showWarnings = FALSE)
+dir.create("results/figures", recursive = TRUE, showWarnings = FALSE)
+dir.create("results/tables", recursive = TRUE, showWarnings = FALSE)
+
+# --- Packages ---
+cran_pkgs <- c(
+  "dplyr", "tidyr", "stringr", "ggplot2",
+  "data.table", "matrixStats", "glmnet", "survival",
+  "rsample", "caret"
+)
+bioc_pkgs <- c("TCGAbiolinks", "SummarizedExperiment")
+
+missing_cran <- cran_pkgs[!cran_pkgs %in% rownames(installed.packages())]
+missing_bioc <- bioc_pkgs[!bioc_pkgs %in% rownames(installed.packages())]
+
+if (length(missing_cran) || length(missing_bioc)) {
+  cat("Missing packages detected. Install and re-knit:
+
+")
+  if (length(missing_cran)) {
+    cat("CRAN:
+  install.packages(c(",
+        paste0('"', missing_cran, '"', collapse = ", "),
+        "))
+
+", sep = "")
+  }
+  if (length(missing_bioc)) {
+    cat("Bioconductor:
+  if (!requireNamespace('BiocManager', quietly=TRUE)) install.packages('BiocManager')
+",
+        "  BiocManager::install(c(",
+        paste0('"', missing_bioc, '"', collapse = ", "),
+        "))
+
+", sep = "")
+  }
+  stop("Please install missing packages and re-run.")
+}
+
+suppressPackageStartupMessages({
+  library(TCGAbiolinks)
+  library(SummarizedExperiment)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(ggplot2)
+  library(data.table)
+  library(matrixStats)
+  library(glmnet)
+  library(survival)
+  library(rsample)
+  library(caret)
+})
+
+sessionInfo()
+```
+
+
+```{r config, message=FALSE, warning=FALSE}
+
+# =========================
+# Project configuration
+# =========================
+
+PROJECT <- "TCGA-BRCA"
+EXP_WORKFLOW <- "STAR - Counts"
+
+# Directory structure
+DIR_DATA_RAW   <- file.path("data", "raw")
+DIR_DATA_PROC  <- file.path("data", "processed")
+DIR_RESULTS    <- file.path("results")
+DIR_FIGS       <- file.path(DIR_RESULTS, "figures")
+DIR_TABLES     <- file.path(DIR_RESULTS, "tables")
+
+dir.create(DIR_DATA_RAW,  recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_DATA_PROC, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_FIGS,      recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_TABLES,    recursive = TRUE, showWarnings = FALSE)
+
+# Define RDS save paths (IMPORTANT)
+FILE_CLIN_RAW  <- file.path(DIR_DATA_RAW,  "brca_clinical_raw.rds")
+FILE_RNA_RAW   <- file.path(DIR_DATA_RAW,  "brca_rna_raw.rds")
+FILE_DATA_PROC <- file.path(DIR_DATA_PROC, "brca_merged_processed.rds")
+
+# Reproducibility
+SEED <- 123
+set.seed(SEED)
+
+# Evaluation plan
+N_REPEATS <- 10
+TRAIN_FRAC <- 0.80
+
+# RNA feature selection settings
+MAX_GENES_PREVAR <- 5000
+P_CUTOFF_COX <- 0.01
+TOP_N_GENES <- 500
+
+cat("Configuration complete.\n")
+```
+
+```{r download_cache_tcga, message=TRUE, warning=FALSE}
+# =========================
+# Download + cache TCGA-BRCA clinical & RNA
+# =========================
+
+# ---- Clinical data (robust XML route) ----
+if (file.exists(FILE_CLIN_RAW)) {
+  message("Loading cached clinical data: ", FILE_CLIN_RAW)
+  clin_raw <- readRDS(FILE_CLIN_RAW)
+} else {
+  message("Downloading clinical XML from GDC (robust route)...")
+
+  clin_query <- GDCquery(
+    project = PROJECT,
+    data.category = "Clinical",
+    data.type = "Clinical Supplement",
+    data.format = "BCR XML"
+  )
+
+  GDCdownload(clin_query)
+
+  clin_raw <- GDCprepare_clinic(clin_query, clinical.info = "patient")
+
+  saveRDS(clin_raw, FILE_CLIN_RAW)
+  message("Saved clinical data to: ", FILE_CLIN_RAW)
+}
+
+message("Clinical data dimensions: ", nrow(clin_raw), " rows x ", ncol(clin_raw), " cols")
+print(head(clin_raw[, 1:min(10, ncol(clin_raw))]))
+
+# ---- RNA expression data (returns data.frame) ----
+if (file.exists(FILE_RNA_RAW)) {
+  message("Loading cached RNA data: ", FILE_RNA_RAW)
+  rna_df <- readRDS(FILE_RNA_RAW)
+} else {
+  message("Querying RNA-seq data (", EXP_WORKFLOW, ") from GDC...")
+
+  rna_query <- GDCquery(
+    project = PROJECT,
+    data.category = "Transcriptome Profiling",
+    data.type = "Gene Expression Quantification",
+    workflow.type = EXP_WORKFLOW,      # "STAR - Counts"
+    sample.type = "Primary Tumor"
+  )
+
+  GDCdownload(rna_query)
+
+  # Avoids creating a large SummarizedExperiment in memory
+  rna_df <- GDCprepare(rna_query, summarizedExperiment = FALSE)
+
+  saveRDS(rna_df, FILE_RNA_RAW)
+  message("Saved RNA data.frame to: ", FILE_RNA_RAW)
+}
+
+message("RNA object class: ", paste(class(rna_df), collapse = ", "))
+message("RNA dimensions: ", nrow(rna_df), " rows x ", ncol(rna_df), " cols")
+message("First columns:")
+print(head(colnames(rna_df), 15))
+message("Preview:")
+print(head(rna_df[, 1:min(8, ncol(rna_df))]))
+
+message("Chunk 3 complete: clinical + RNA downloaded/loaded and ready for processing.")
+```
+
+```{r process_merge, message=TRUE, warning=FALSE}
+# =========================
+# Process clinical + RNA and merge at patient level (BRCA)
+# Requires objects: clin_raw, rna_df
+# Requires params: MAX_GENES_PREVAR, FILE_DATA_PROC
+# =========================
+
+# ---- 0) Safety checks ----
+stopifnot(exists("clin_raw"))
+stopifnot(exists("rna_df"))
+
+# ---- 1) RNA: identify sample columns ----
+all_cols <- colnames(rna_df)
+sample_cols <- grep("^unstranded_TCGA-", all_cols, value = TRUE)
+message("Found ", length(sample_cols), " RNA sample columns.")
+
+# ---- 2) RNA: keep protein-coding genes + gene metadata ----
+# Reduce size and keep biologically meaningful genes
+rna_sub <- rna_df[gene_type == "protein_coding", c("gene_id", "gene_name", "gene_type", sample_cols), with = FALSE]
+message("Protein-coding genes: ", nrow(rna_sub))
+
+# Clean Ensembl IDs (remove version suffix ENSG... .15 -> ENSG...)
+rna_sub[, gene_id_clean := sub("\\..*$", "", gene_id)]
+
+# Deduplicate genes if necessary
+rna_sub <- rna_sub[!duplicated(gene_id_clean)]
+
+# Create counts matrix: genes x samples
+gene_ids <- rna_sub$gene_id_clean
+counts_mat <- as.matrix(rna_sub[, ..sample_cols])
+rownames(counts_mat) <- gene_ids
+message("Counts matrix dims (genes x samples): ", nrow(counts_mat), " x ", ncol(counts_mat))
+
+# ---- 3) RNA: sample -> patient mapping; collapse to one sample per patient ----
+sample_barcodes <- sub("^unstranded_", "", colnames(counts_mat))  # remove prefix
+patient_barcodes <- substr(sample_barcodes, 1, 12)
+
+# Keep first occurrence per patient (simple, reproducible)
+keep_idx <- !duplicated(patient_barcodes)
+counts_mat <- counts_mat[, keep_idx, drop = FALSE]
+patient_barcodes <- patient_barcodes[keep_idx]
+colnames(counts_mat) <- patient_barcodes
+message("After collapsing to one sample/patient: ", ncol(counts_mat), " patients with RNA.")
+
+# ---- 4) RNA: normalize counts -> logCPM ----
+# CPM normalizes library size; log1p stabilizes variance for modeling
+lib_size <- colSums(counts_mat)
+cpm <- t(t(counts_mat) / lib_size * 1e6)
+logcpm <- log1p(cpm)
+rm(cpm); gc()
+
+# ---- 5) RNA: variance filter (speed + denoise) ----
+gene_var <- matrixStats::rowVars(logcpm)
+ord <- order(gene_var, decreasing = TRUE)
+keep_genes <- ord[1:min(MAX_GENES_PREVAR, length(ord))]
+logcpm_filt <- logcpm[keep_genes, , drop = FALSE]
+message("After variance filter: ", nrow(logcpm_filt), " genes x ", ncol(logcpm_filt), " patients")
+
+# ---- 6) Clinical: build survival time/event robustly (vital_status may be NA) ----
+# Since we have parsed clinical table, vital_status is all NA, so we defined event via days_to_death.
+clin <- clin_raw %>%
+  dplyr::transmute(
+    patient_barcode = bcr_patient_barcode,
+    gender = gender,
+    age_at_dx_years = suppressWarnings(as.numeric(age_at_initial_pathologic_diagnosis)),
+    stage_pathologic = stage_event_pathologic_stage,
+    days_to_death = suppressWarnings(as.numeric(days_to_death)),
+    days_to_last_followup = suppressWarnings(as.numeric(days_to_last_followup))
+  ) %>%
+  dplyr::mutate(
+    event = ifelse(!is.na(days_to_death), 1L, 0L),
+    time = ifelse(event == 1L, days_to_death, days_to_last_followup)
+  ) %>%
+  dplyr::filter(!is.na(time) & time > 0)
+
+censor_rate <- mean(clin$event == 0, na.rm = TRUE)
+event_rate  <- mean(clin$event == 1, na.rm = TRUE)
+
+message("Clinical patients with usable survival: ", nrow(clin))
+message("Censoring rate: ", round(censor_rate, 3))
+message("Event rate: ", round(event_rate, 3))
+
+# ---- 7) Merge: keep patients with BOTH RNA + clinical survival ----
+common_patients <- intersect(colnames(logcpm_filt), clin$patient_barcode)
+message("Patients with BOTH RNA + survival: ", length(common_patients))
+
+# RNA for modeling: patients x genes (glmnet expects samples in rows)
+X_rna <- t(logcpm_filt[, common_patients, drop = FALSE])
+
+# Clinical aligned to RNA patient order
+y_surv <- clin %>%
+  dplyr::filter(patient_barcode %in% common_patients) %>%
+  dplyr::arrange(match(patient_barcode, common_patients))
+
+stopifnot(all(y_surv$patient_barcode == common_patients))
+
+message("Merged set event rate: ", round(mean(y_surv$event == 1, na.rm = TRUE), 3))
+
+# ---- 8) Save processed bundle ----
+processed <- list(
+  X_rna = X_rna,        # patients x genes (logCPM)
+  y = y_surv,           # clinical + survival outcomes aligned to X_rna rows
+  censoring_rate = censor_rate,
+  event_rate = event_rate,
+  project = PROJECT,
+  workflow = EXP_WORKFLOW
+)
+
+saveRDS(processed, FILE_DATA_PROC)
+message("Saved processed merged dataset to: ", FILE_DATA_PROC)
+
+# ---- 9) Final sanity checks ----
+message("Final RNA matrix dims (patients x genes): ", nrow(X_rna), " x ", ncol(X_rna))
+message("Example patient barcodes: ", paste(head(y_surv$patient_barcode, 3), collapse = ", "))
+
+```
+
+
+```{r chunk5_modeling_late_fusion, message=TRUE, warning=FALSE}
+# =========================
+# Benchmark unimodal survival models per modality, select best, then late-fuse
+# Modalities:
+#   - Clinical features (low-dim)
+#   - RNA (high-dim; 5000 genes)
+#
+# Models attempted (if package available):
+#   - Cox PH (survival::coxph)           [clinical only by default; can do RNA but not recommended]
+#   - Elastic Net Cox (glmnet)          [clinical + RNA]
+#   - Random Survival Forest (randomForestSRC::rfsrc) [clinical + RNA, but RNA may be slow]
+#   - Gradient Boosting Cox (gbm::gbm with distribution="coxph") [clinical + RNA, RNA may be slow]
+#   - DeepSurv (optional; skipped if not available)
+#
+# Selection:
+#   For each repeat:
+#     Outer split: 80/20 stratified by event
+#     Inner split: 80/20 within training to pick best model by validation C-index
+#     Fit best model on full training, evaluate on test
+#     Late fusion: weighted average of risk scores from best clinical + best RNA (weights ∝ validation C-index)
+# =========================
+
+processed <- readRDS(FILE_DATA_PROC)
+X_rna <- processed$X_rna  # patients x genes (logCPM)
+y <- processed$y
+
+# ---- Fix: Cox models require strictly positive times ----
+keep_pos_time <- which(as.numeric(y$time) > 0 & !is.na(y$time) & !is.na(y$event))
+message("Filtering to positive times: keeping ", length(keep_pos_time), " / ", nrow(y), " patients")
+y <- y[keep_pos_time, , drop = FALSE]
+X_rna <- X_rna[keep_pos_time, , drop = FALSE]
+
+time_all <- as.numeric(y$time)
+event_all <- as.integer(y$event)
+stopifnot(all(time_all > 0))
+stopifnot(all(event_all %in% c(0,1)))
+stopifnot(nrow(X_rna) == nrow(y))
+
+# ---- Helper: Harrell C-index ----
+harrell_cindex <- function(time, event, risk_score) {
+  # Higher risk_score should correspond to higher hazard / earlier event
+  s <- survival::Surv(time, event)
+  as.numeric(survival::concordance(s ~ risk_score)$concordance)
+}
+
+# ---- Stratified split ----
+make_split_idx <- function(event, train_frac = 0.8, seed = 123) {
+  set.seed(seed)
+  idx1 <- which(event == 1)
+  idx0 <- which(event == 0)
+
+  n1_train <- max(1, ceiling(length(idx1) * train_frac))
+  n0_train <- max(1, ceiling(length(idx0) * train_frac))
+
+  train_idx <- c(sample(idx1, n1_train), sample(idx0, n0_train))
+  test_idx  <- setdiff(seq_along(event), train_idx)
+  list(train = train_idx, test = test_idx)
+}
+
+# ---- Build clinical design matrix (robust, no row drops) ----
+build_clin_matrix <- function(df) {
+  df2 <- df %>%
+    dplyr::mutate(
+      age_at_dx_years = suppressWarnings(as.numeric(age_at_dx_years)),
+      gender = trimws(as.character(gender)),
+      stage_pathologic = trimws(as.character(stage_pathologic))
+    )
+
+  med_age <- median(df2$age_at_dx_years, na.rm = TRUE)
+  if (is.na(med_age)) med_age <- 0
+  df2$age_at_dx_years[is.na(df2$age_at_dx_years)] <- med_age
+
+  df2$gender[is.na(df2$gender) | df2$gender == ""] <- "Unknown"
+  df2$stage_pathologic[df2$stage_pathologic %in% c("", "[Not Available]", "Not Reported")] <- NA
+  df2$stage_pathologic[is.na(df2$stage_pathologic)] <- "Unknown"
+
+  df2$gender <- factor(df2$gender)
+  df2$stage_pathologic <- factor(df2$stage_pathologic)
+
+  X <- model.matrix(~ age_at_dx_years + gender + stage_pathologic, data = df2)
+  X <- X[, colnames(X) != "(Intercept)", drop = FALSE]
+  as.matrix(X)
+}
+
+X_clin_all <- build_clin_matrix(y)
+stopifnot(nrow(X_clin_all) == nrow(y))
+
+# ==========================================================
+# Model wrappers: fit + predict risk (higher = higher risk)
+# ==========================================================
+
+# 1) Cox PH (survival::coxph) - use clinical only by default (RNA too high-dim)
+fit_coxph <- function(X, time, event) {
+  df <- as.data.frame(X)
+  df$time <- time
+  df$event <- event
+  survival::coxph(survival::Surv(time, event) ~ ., data = df, ties = "efron", x = TRUE)
+}
+pred_coxph <- function(fit, Xnew) {
+  as.numeric(stats::predict(fit, newdata = as.data.frame(Xnew), type = "lp"))
+}
+
+# 2) Elastic Net Cox (glmnet)
+fit_glmnet <- function(X, time, event, seed = 123, alpha = 0.5) {
+  set.seed(seed)
+  glmnet::cv.glmnet(
+    x = X,
+    y = survival::Surv(time, event),
+    family = "cox",
+    alpha = alpha,
+    nfolds = 5
+  )
+}
+pred_glmnet <- function(cvfit, Xnew) {
+  as.numeric(predict(cvfit, newx = Xnew, s = "lambda.min", type = "link"))
+}
+
+# 3) Random Survival Forest (randomForestSRC)
+has_rsf <- requireNamespace("randomForestSRC", quietly = TRUE)
+fit_rsf <- function(X, time, event, seed = 123) {
+  if (!has_rsf) stop("randomForestSRC not installed")
+  set.seed(seed)
+  df <- as.data.frame(X)
+  df$time <- time
+  df$event <- event
+  randomForestSRC::rfsrc(survival::Surv(time, event) ~ ., data = df, ntree = 500, importance = "none")
+}
+pred_rsf <- function(fit, Xnew) {
+  # Use predicted mortality as risk score if available; otherwise 1 - survival at last time
+  p <- predict(fit, newdata = as.data.frame(Xnew))
+  if (!is.null(p$predicted)) return(as.numeric(p$predicted))       # often mortality/risk-like
+  if (!is.null(p$chf)) return(as.numeric(rowSums(p$chf)))          # cumulative hazard sum as risk
+  stop("RSF predict output not recognized")
+}
+
+# 4) Gradient Boosting Cox (gbm)
+has_gbm <- requireNamespace("gbm", quietly = TRUE)
+fit_gbm_cox <- function(X, time, event, seed = 123) {
+  if (!has_gbm) stop("gbm not installed")
+  set.seed(seed)
+  df <- as.data.frame(X)
+  df$time <- time
+  df$event <- event
+  # gbm uses Surv(time, event) with dist="coxph"
+  gbm::gbm(
+    formula = survival::Surv(time, event) ~ .,
+    data = df,
+    distribution = "coxph",
+    n.trees = 3000,
+    interaction.depth = 2,
+    shrinkage = 0.01,
+    n.minobsinnode = 10,
+    bag.fraction = 0.6,
+    train.fraction = 1.0,
+    verbose = FALSE
+  )
+}
+pred_gbm_cox <- function(fit, Xnew) {
+  # type="link" gives linear predictor for CoxPH distribution
+  as.numeric(gbm::predict.gbm(fit, newdata = as.data.frame(Xnew), n.trees = fit$n.trees, type = "link"))
+}
+
+# 5) DeepSurv (optional)
+# We will try survivalmodels::deepsurv if available; otherwise skip.
+has_survmodels <- requireNamespace("survivalmodels", quietly = TRUE)
+fit_deepsurv <- function(X, time, event, seed = 123) {
+  if (!has_survmodels) stop("survivalmodels not installed")
+  set.seed(seed)
+  # survivalmodels expects data.frame inputs
+  df <- as.data.frame(X)
+  df$time <- time
+  df$event <- event
+  # A simple DeepSurv config; you can tune later
+  survivalmodels::deepsurv(
+    formula = survival::Surv(time, event) ~ .,
+    data = df,
+    epochs = 50,
+    batch_size = 64,
+    learning_rate = 1e-3,
+    hidden = c(64, 32),
+    dropout = 0.2,
+    verbose = 0
+  )
+}
+pred_deepsurv <- function(fit, Xnew) {
+  as.numeric(predict(fit, newdata = as.data.frame(Xnew), type = "lp"))
+}
+
+# ----------------------------------------------------------
+# Benchmark candidates per modality on inner validation split
+# ----------------------------------------------------------
+evaluate_candidates <- function(modality_name, X_train, time_train, event_train, seed = 123) {
+  inner <- make_split_idx(event_train, train_frac = 0.8, seed = seed)
+  tr <- inner$train
+  va <- inner$test
+
+  # Candidate list depends on modality
+  # For RNA (5000 dims), CoxPH is not ideal; skip CoxPH by default.
+  cand <- list()
+
+  if (modality_name == "clin") {
+    cand$coxph <- list(
+      fit = function() fit_coxph(X_train[tr, , drop=FALSE], time_train[tr], event_train[tr]),
+      pred = function(m) pred_coxph(m, X_train[va, , drop=FALSE])
+    )
+  }
+
+  cand$glmnet <- list(
+    fit = function() fit_glmnet(X_train[tr, , drop=FALSE], time_train[tr], event_train[tr], seed = seed + 10, alpha = 0.5),
+    pred = function(m) pred_glmnet(m, X_train[va, , drop=FALSE])
+  )
+
+  if (has_rsf) {
+    cand$rsf <- list(
+      fit = function() fit_rsf(X_train[tr, , drop=FALSE], time_train[tr], event_train[tr], seed = seed + 20),
+      pred = function(m) pred_rsf(m, X_train[va, , drop=FALSE])
+    )
+  }
+
+  if (has_gbm) {
+    cand$gbm_cox <- list(
+      fit = function() fit_gbm_cox(X_train[tr, , drop=FALSE], time_train[tr], event_train[tr], seed = seed + 30),
+      pred = function(m) pred_gbm_cox(m, X_train[va, , drop=FALSE])
+    )
+  }
+
+  if (has_survmodels) {
+    cand$deepsurv <- list(
+      fit = function() fit_deepsurv(X_train[tr, , drop=FALSE], time_train[tr], event_train[tr], seed = seed + 40),
+      pred = function(m) pred_deepsurv(m, X_train[va, , drop=FALSE])
+    )
+  }
+
+  scores <- data.frame(model = character(), cindex_val = numeric(), stringsAsFactors = FALSE)
+  fitted <- list()
+
+  for (nm in names(cand)) {
+    out <- tryCatch({
+      m <- cand[[nm]]$fit()
+      risk_va <- cand[[nm]]$pred(m)
+      ci_va <- harrell_cindex(time_train[va], event_train[va], risk_va)
+      fitted[[nm]] <- m
+      data.frame(model = nm, cindex_val = ci_va)
+    }, error = function(e) {
+      message("[", modality_name, "] Skipping ", nm, " (error: ", e$message, ")")
+      data.frame(model = nm, cindex_val = NA_real_)
+    })
+    scores <- rbind(scores, out)
+  }
+
+  # pick best by validation C-index
+  scores_ok <- scores %>% dplyr::filter(!is.na(cindex_val))
+  if (nrow(scores_ok) == 0) {
+    return(list(best_model = NA_character_, best_cindex = NA_real_, scores = scores))
+  }
+  best_row <- scores_ok[which.max(scores_ok$cindex_val), , drop=FALSE]
+  list(best_model = best_row$model[1], best_cindex = best_row$cindex_val[1], scores = scores)
+}
+
+# Fit selected model on FULL training and predict on test
+fit_selected_and_predict <- function(modality_name, model_name, X_train, time_train, event_train, X_test, seed = 123) {
+  if (is.na(model_name)) return(list(risk_test = rep(NA_real_, nrow(X_test))))
+
+  # switch
+  if (model_name == "coxph") {
+    m <- fit_coxph(X_train, time_train, event_train)
+    risk <- pred_coxph(m, X_test)
+    return(list(risk_test = risk))
+  }
+  if (model_name == "glmnet") {
+    m <- fit_glmnet(X_train, time_train, event_train, seed = seed + 10, alpha = 0.5)
+    risk <- pred_glmnet(m, X_test)
+    return(list(risk_test = risk))
+  }
+  if (model_name == "rsf") {
+    m <- fit_rsf(X_train, time_train, event_train, seed = seed + 20)
+    risk <- pred_rsf(m, X_test)
+    return(list(risk_test = risk))
+  }
+  if (model_name == "gbm_cox") {
+    m <- fit_gbm_cox(X_train, time_train, event_train, seed = seed + 30)
+    risk <- pred_gbm_cox(m, X_test)
+    return(list(risk_test = risk))
+  }
+  if (model_name == "deepsurv") {
+    m <- fit_deepsurv(X_train, time_train, event_train, seed = seed + 40)
+    risk <- pred_deepsurv(m, X_test)
+    return(list(risk_test = risk))
+  }
+
+  stop("Unknown model_name: ", model_name)
+}
+
+# =========================
+# Run repeats
+# =========================
+results <- data.frame(
+  repeat_id = integer(),
+
+  clin_best = character(),
+  clin_val_cindex = numeric(),
+  clin_test_cindex = numeric(),
+
+  rna_best = character(),
+  rna_val_cindex = numeric(),
+  rna_test_cindex = numeric(),
+
+  fused_test_cindex = numeric(),
+  w_clin = numeric(),
+  w_rna = numeric(),
+
+  stringsAsFactors = FALSE
+)
+
+for (r in seq_len(N_REPEATS)) {
+  seed_r <- GLOBAL_SEED + r
+  split <- make_split_idx(event_all, train_frac = TRAIN_FRAC, seed = seed_r)
+  tr <- split$train
+  te <- split$test
+
+  # Guard: ensure test has events (otherwise C-index can be NA)
+  if (sum(event_all[te] == 1) < 3) {
+    message(sprintf("Repeat %02d skipped: too few events in test (%d)", r, sum(event_all[te] == 1)))
+    next
+  }
+
+  # ---- Select best clinical model ----
+  clin_sel <- evaluate_candidates(
+    modality_name = "clin",
+    X_train = X_clin_all[tr, , drop=FALSE],
+    time_train = time_all[tr],
+    event_train = event_all[tr],
+    seed = seed_r + 1000
+  )
+
+  # ---- Select best RNA model ----
+  # Note: RSF/GBM/DeepSurv on 5000-gene RNA can be heavy; if slow, we can restrict candidates for RNA.
+  rna_sel <- evaluate_candidates(
+    modality_name = "rna",
+    X_train = X_rna[tr, , drop=FALSE],
+    time_train = time_all[tr],
+    event_train = event_all[tr],
+    seed = seed_r + 2000
+  )
+
+  # ---- Fit selected models on full training and predict on test ----
+  clin_pred <- fit_selected_and_predict(
+    modality_name = "clin",
+    model_name = clin_sel$best_model,
+    X_train = X_clin_all[tr, , drop=FALSE],
+    time_train = time_all[tr],
+    event_train = event_all[tr],
+    X_test  = X_clin_all[te, , drop=FALSE],
+    seed = seed_r + 3000
+  )
+
+  rna_pred <- fit_selected_and_predict(
+    modality_name = "rna",
+    model_name = rna_sel$best_model,
+    X_train = X_rna[tr, , drop=FALSE],
+    time_train = time_all[tr],
+    event_train = event_all[tr],
+    X_test  = X_rna[te, , drop=FALSE],
+    seed = seed_r + 4000
+  )
+
+  # ---- Compute test C-indexes ----
+  clin_test_ci <- harrell_cindex(time_all[te], event_all[te], clin_pred$risk_test)
+  rna_test_ci  <- harrell_cindex(time_all[te], event_all[te], rna_pred$risk_test)
+
+  # ---- Fusion weights proportional to validation C-index ----
+  w_raw <- c(
+    clin = max(clin_sel$best_cindex, 1e-6),
+    rna  = max(rna_sel$best_cindex,  1e-6)
+  )
+  w <- w_raw / sum(w_raw)
+  w_clin <- as.numeric(w["clin"])
+  w_rna  <- as.numeric(w["rna"])
+
+  fused_risk <- w_clin * clin_pred$risk_test + w_rna * rna_pred$risk_test
+  fused_ci <- harrell_cindex(time_all[te], event_all[te], fused_risk)
+
+  results <- rbind(results, data.frame(
+    repeat_id = r,
+
+    clin_best = clin_sel$best_model,
+    clin_val_cindex = clin_sel$best_cindex,
+    clin_test_cindex = clin_test_ci,
+
+    rna_best = rna_sel$best_model,
+    rna_val_cindex = rna_sel$best_cindex,
+    rna_test_cindex = rna_test_ci,
+
+    fused_test_cindex = fused_ci,
+    w_clin = w_clin,
+    w_rna = w_rna
+  ))
+
+  message(sprintf(
+    "Repeat %02d | clin(best=%s val=%.3f test=%.3f) | rna(best=%s val=%.3f test=%.3f) | fused=%.3f | w(clin=%.2f,rna=%.2f)",
+    r,
+    clin_sel$best_model, clin_sel$best_cindex, clin_test_ci,
+    rna_sel$best_model,  rna_sel$best_cindex,  rna_test_ci,
+    fused_ci, w_clin, w_rna
+  ))
+}
+
+# ---- Summary (NA-safe) ----
+summ <- results %>%
+  dplyr::summarise(
+    n_repeats = dplyr::n(),
+    clin_mean = mean(clin_test_cindex, na.rm = TRUE),
+    clin_sd   = sd(clin_test_cindex, na.rm = TRUE),
+    rna_mean  = mean(rna_test_cindex, na.rm = TRUE),
+    rna_sd    = sd(rna_test_cindex, na.rm = TRUE),
+    fused_mean = mean(fused_test_cindex, na.rm = TRUE),
+    fused_sd   = sd(fused_test_cindex, na.rm = TRUE),
+    w_clin_mean = mean(w_clin, na.rm = TRUE),
+    w_rna_mean  = mean(w_rna, na.rm = TRUE)
+  )
+
+message("\n===== Summary across repeats =====")
+print(summ)
+
+# ---- Save ----
+out_csv <- file.path(DIR_TABLES, "brca_benchmark_select_fuse_results.csv")
+write.csv(results, out_csv, row.names = FALSE)
+message("Saved per-repeat results to: ", out_csv)
+
+# ---- Quick plot ----
+pdat <- results %>%
+  dplyr::select(repeat_id, clin_test_cindex, rna_test_cindex, fused_test_cindex) %>%
+  tidyr::pivot_longer(-repeat_id, names_to = "model", values_to = "cindex")
+
+ggplot2::ggplot(pdat, ggplot2::aes(x = model, y = cindex)) +
+  ggplot2::geom_boxplot() +
+  ggplot2::labs(title = "BRCA test C-index across repeats (best-per-modality selection)", x = "", y = "Harrell's C-index") +
+  ggplot2::theme_bw()
+```
+
+```{r 5fold_cv_with_calibration, message=TRUE, warning=FALSE}
+# =========================
+# 5-fold stratified CV + statistical comparison + simple 5-year Brier-style score
+#
+# What you get:
+# - Fold-wise C-index for: Clinical, RNA, Fused
+# - Fold-wise "Brier-style" score at 5 years (relative calibration proxy) for: Clinical, RNA, Fused
+# - Paired Wilcoxon tests (Fused vs Clinical, Fused vs RNA) for both C-index and Brier
+# - Effect sizes (mean deltas)
+# =========================
+
+suppressPackageStartupMessages({
+  library(survival)
+  library(glmnet)
+  library(dplyr)
+    library(randomForestSRC)
+  library(gbm)
+})
+
+# ---- Load processed bundle ----
+processed <- readRDS(FILE_DATA_PROC)
+X_rna <- processed$X_rna
+y <- processed$y
+
+# ---- Keep strictly positive survival times (required for Cox-family learners) ----
+keep <- which(as.numeric(y$time) > 0 & !is.na(y$time) & !is.na(y$event))
+message("Filtering to positive times: keeping ", length(keep), " / ", nrow(y), " patients")
+X_rna <- X_rna[keep, , drop = FALSE]
+y <- y[keep, , drop = FALSE]
+
+time_all <- as.numeric(y$time)
+event_all <- as.integer(y$event)
+stopifnot(all(time_all > 0))
+stopifnot(all(event_all %in% c(0, 1)))
+stopifnot(nrow(X_rna) == nrow(y))
+
+# ---- Helper: Harrell C-index ----
+harrell_cindex <- function(time, event, risk_score) {
+  # Higher risk_score should correspond to higher hazard / earlier event
+  s <- survival::Surv(time, event)
+  as.numeric(survival::concordance(s ~ risk_score)$concordance)
+}
+
+# ---- Helper: stratified fold assignment without extra deps ----
+make_strat_folds <- function(event, K = 5, seed = 123) {
+  set.seed(seed)
+  idx1 <- sample(which(event == 1))
+  idx0 <- sample(which(event == 0))
+  folds <- vector("list", K)
+  for (k in seq_len(K)) folds[[k]] <- integer(0)
+
+  # round-robin assign events/censored separately
+  for (i in seq_along(idx1)) folds[[ (i - 1) %% K + 1 ]] <- c(folds[[ (i - 1) %% K + 1 ]], idx1[i])
+  for (i in seq_along(idx0)) folds[[ (i - 1) %% K + 1 ]] <- c(folds[[ (i - 1) %% K + 1 ]], idx0[i])
+
+  folds
+}
+
+# ---- Clinical matrix builder ----
+build_clin_matrix <- function(df) {
+  df2 <- df %>%
+    dplyr::mutate(
+      age_at_dx_years = suppressWarnings(as.numeric(age_at_dx_years)),
+      gender = trimws(as.character(gender)),
+      stage_pathologic = trimws(as.character(stage_pathologic))
+    )
+
+  med_age <- median(df2$age_at_dx_years, na.rm = TRUE)
+  if (is.na(med_age)) med_age <- 0
+  df2$age_at_dx_years[is.na(df2$age_at_dx_years)] <- med_age
+
+  df2$gender[is.na(df2$gender) | df2$gender == ""] <- "Unknown"
+  df2$stage_pathologic[df2$stage_pathologic %in% c("", "[Not Available]", "Not Reported")] <- NA
+  df2$stage_pathologic[is.na(df2$stage_pathologic)] <- "Unknown"
+
+  df2$gender <- factor(df2$gender)
+  df2$stage_pathologic <- factor(df2$stage_pathologic)
+
+  X <- model.matrix(~ age_at_dx_years + gender + stage_pathologic, data = df2)
+  X <- X[, colnames(X) != "(Intercept)", drop = FALSE]
+  as.matrix(X)
+}
+
+X_clin_all <- build_clin_matrix(y)
+stopifnot(nrow(X_clin_all) == nrow(y))
+
+# ---- Brier-style score at 5 years (t_star) ----
+# We convert a risk score to a pseudo survival probability via a monotone mapping.
+# This is NOT IPCW IBS; it is a stable, dependency-light proxy for comparing calibration tendencies.
+brier_5yr_proxy <- function(time, risk_score, t_star = 1825) {
+  # Binary label: survived beyond t_star?
+  y_true <- as.numeric(time > t_star)
+
+  # Map risk -> pseudo survival probability in (0,1), monotone decreasing in risk
+  z <- as.numeric(scale(risk_score))
+  s_hat <- exp(-exp(z))  # higher risk -> smaller s_hat
+
+  mean((y_true - s_hat)^2, na.rm = TRUE)
+}
+
+# ---- Model fits ----
+fit_coxph <- function(X, time, event) {
+  df <- as.data.frame(X)
+  df$time <- time
+  df$event <- event
+  survival::coxph(survival::Surv(time, event) ~ ., data = df, ties = "efron", x = TRUE)
+}
+pred_coxph <- function(fit, Xnew) {
+  as.numeric(stats::predict(fit, newdata = as.data.frame(Xnew), type = "lp"))
+}
+
+fit_glmnet <- function(X, time, event, seed = 123, alpha = 0.5) {
+  set.seed(seed)
+  glmnet::cv.glmnet(
+    x = X,
+    y = survival::Surv(time, event),
+    family = "cox",
+    alpha = alpha,
+    nfolds = 5
+  )
+}
+pred_glmnet <- function(fit, Xnew) {
+  as.numeric(predict(fit, newx = Xnew, s = "lambda.min", type = "link"))
+}
+
+fit_rsf <- function(X, time, event, seed = 123) {
+  set.seed(seed)
+  df <- as.data.frame(X)
+  df$time <- time
+  df$event <- event
+  randomForestSRC::rfsrc(survival::Surv(time, event) ~ ., data = df, ntree = 500, importance = "none")
+}
+pred_rsf <- function(fit, Xnew) {
+  p <- predict(fit, newdata = as.data.frame(Xnew))
+  if (!is.null(p$predicted)) return(as.numeric(p$predicted))
+  if (!is.null(p$chf)) return(as.numeric(rowSums(p$chf)))
+  stop("RSF predict output not recognized")
+}
+
+fit_gbm_cox <- function(X, time, event, seed = 123) {
+  set.seed(seed)
+  df <- as.data.frame(X)
+  df$time <- time
+  df$event <- event
+  gbm::gbm(
+    formula = survival::Surv(time, event) ~ .,
+    data = df,
+    distribution = "coxph",
+    n.trees = 2000,
+    interaction.depth = 2,
+    shrinkage = 0.01,
+    n.minobsinnode = 10,
+    bag.fraction = 0.6,
+    train.fraction = 1.0,
+    verbose = FALSE
+  )
+}
+pred_gbm_cox <- function(fit, Xnew) {
+  as.numeric(gbm::predict.gbm(fit, newdata = as.data.frame(Xnew), n.trees = fit$n.trees, type = "link"))
+}
+
+# ---- Model selection on an inner split (within training only) ----
+select_best_model <- function(modality, X_train, time_train, event_train, seed = 1) {
+  # inner 80/20 stratified
+  inner_folds <- make_strat_folds(event_train, K = 5, seed = seed)
+  # take fold1 as "val", others as "train"
+  va <- inner_folds[[1]]
+  tr <- setdiff(seq_along(event_train), va)
+
+  candidates <- list()
+
+  if (modality == "clin") {
+    candidates$coxph <- list(
+      fit = function() fit_coxph(X_train[tr,,drop=FALSE], time_train[tr], event_train[tr]),
+      pred = function(m) pred_coxph(m, X_train[va,,drop=FALSE])
+    )
+    candidates$glmnet <- list(
+      fit = function() fit_glmnet(X_train[tr,,drop=FALSE], time_train[tr], event_train[tr], seed = seed + 10),
+      pred = function(m) pred_glmnet(m, X_train[va,,drop=FALSE])
+    )
+  } else {
+    # RNA
+    candidates$glmnet <- list(
+      fit = function() fit_glmnet(X_train[tr,,drop=FALSE], time_train[tr], event_train[tr], seed = seed + 20),
+      pred = function(m) pred_glmnet(m, X_train[va,,drop=FALSE])
+    )
+    candidates$rsf <- list(
+      fit = function() fit_rsf(X_train[tr,,drop=FALSE], time_train[tr], event_train[tr], seed = seed + 30),
+      pred = function(m) pred_rsf(m, X_train[va,,drop=FALSE])
+    )
+    candidates$gbm <- list(
+      fit = function() fit_gbm_cox(X_train[tr,,drop=FALSE], time_train[tr], event_train[tr], seed = seed + 40),
+      pred = function(m) pred_gbm_cox(m, X_train[va,,drop=FALSE])
+    )
+  }
+
+  scores <- data.frame(model = character(), cindex_val = numeric())
+  for (nm in names(candidates)) {
+    out <- tryCatch({
+      m <- candidates[[nm]]$fit()
+      r <- candidates[[nm]]$pred(m)
+      ci <- harrell_cindex(time_train[va], event_train[va], r)
+      data.frame(model = nm, cindex_val = ci)
+    }, error = function(e) {
+      message("[", modality, "] skipping ", nm, " (", e$message, ")")
+      data.frame(model = nm, cindex_val = NA_real_)
+    })
+    scores <- rbind(scores, out)
+  }
+
+  scores_ok <- scores %>% dplyr::filter(!is.na(cindex_val))
+  if (nrow(scores_ok) == 0) return(list(best = NA_character_, best_ci = NA_real_))
+
+  best_row <- scores_ok[which.max(scores_ok$cindex_val), , drop = FALSE]
+  list(best = best_row$model[1], best_ci = best_row$cindex_val[1], scores = scores)
+}
+
+# ---- Fit selected model on full training and predict on test ----
+fit_predict_selected <- function(modality, model_name, X_train, time_train, event_train, X_test, seed = 1) {
+  if (is.na(model_name)) return(rep(NA_real_, nrow(X_test)))
+
+  if (model_name == "coxph") {
+    m <- fit_coxph(X_train, time_train, event_train)
+    return(pred_coxph(m, X_test))
+  }
+  if (model_name == "glmnet") {
+    m <- fit_glmnet(X_train, time_train, event_train, seed = seed + 100)
+    return(pred_glmnet(m, X_test))
+  }
+  if (model_name == "rsf") {
+    m <- fit_rsf(X_train, time_train, event_train, seed = seed + 200)
+    return(pred_rsf(m, X_test))
+  }
+  if (model_name == "gbm") {
+    m <- fit_gbm_cox(X_train, time_train, event_train, seed = seed + 300)
+    return(pred_gbm_cox(m, X_test))
+  }
+
+  stop("Unknown model: ", model_name)
+}
+
+# =========================
+# 5-fold CV loop
+# =========================
+K <- 5
+folds <- make_strat_folds(event_all, K = K, seed = GLOBAL_SEED)
+t_star <- 1825  # 5 years (days)
+
+results_cv <- data.frame()
+
+for (k in seq_len(K)) {
+  message("\n===== Outer fold ", k, "/", K, " =====")
+  test_idx <- folds[[k]]
+  train_idx <- setdiff(seq_len(nrow(y)), test_idx)
+
+  # Guard: ensure test has enough events to compute c-index
+  if (sum(event_all[test_idx] == 1) < 3) {
+    message("Skipping fold ", k, ": too few events in test (", sum(event_all[test_idx] == 1), ")")
+    next
+  }
+
+  # Split data
+  Xc_tr <- X_clin_all[train_idx, , drop=FALSE]
+  Xc_te <- X_clin_all[test_idx, , drop=FALSE]
+  Xr_tr <- X_rna[train_idx, , drop=FALSE]
+  Xr_te <- X_rna[test_idx, , drop=FALSE]
+
+  time_tr <- time_all[train_idx]
+  event_tr <- event_all[train_idx]
+  time_te <- time_all[test_idx]
+  event_te <- event_all[test_idx]
+
+  # ---- Model selection (inner split) ----
+  sel_clin <- select_best_model("clin", Xc_tr, time_tr, event_tr, seed = 1000 + k)
+  sel_rna  <- select_best_model("rna",  Xr_tr, time_tr, event_tr, seed = 2000 + k)
+
+  message("Selected clinical model: ", sel_clin$best, " (val C-index=", round(sel_clin$best_ci, 3), ")")
+  message("Selected RNA model: ", sel_rna$best, " (val C-index=", round(sel_rna$best_ci, 3), ")")
+
+  # ---- Fit selected and predict ----
+  risk_clin <- fit_predict_selected("clin", sel_clin$best, Xc_tr, time_tr, event_tr, Xc_te, seed = 3000 + k)
+  risk_rna  <- fit_predict_selected("rna",  sel_rna$best,  Xr_tr, time_tr, event_tr, Xr_te, seed = 4000 + k)
+
+  # ---- Fusion weights from validation C-index ----
+  if (is.na(sel_clin$best_ci) | is.na(sel_rna$best_ci)) {
+    w_clin <- NA_real_
+    w_rna <- NA_real_
+    risk_fused <- rep(NA_real_, length(risk_clin))
+  } else {
+    w_raw <- c(clin = max(sel_clin$best_ci, 1e-6), rna = max(sel_rna$best_ci, 1e-6))
+    w <- w_raw / sum(w_raw)
+    w_clin <- as.numeric(w["clin"])
+    w_rna  <- as.numeric(w["rna"])
+    risk_fused <- w_clin * risk_clin + w_rna * risk_rna
+  }
+
+  # ---- Metrics: C-index ----
+  c_clin <- harrell_cindex(time_te, event_te, risk_clin)
+  c_rna  <- harrell_cindex(time_te, event_te, risk_rna)
+  c_fuse <- harrell_cindex(time_te, event_te, risk_fused)
+
+  # ---- Metrics: Brier-style proxy at 5 years ----
+  b_clin <- brier_5yr_proxy(time_te, risk_clin, t_star = t_star)
+  b_rna  <- brier_5yr_proxy(time_te, risk_rna,  t_star = t_star)
+  b_fuse <- brier_5yr_proxy(time_te, risk_fused, t_star = t_star)
+
+  results_cv <- rbind(results_cv, data.frame(
+    fold = k,
+    clin_model = sel_clin$best,
+    rna_model = sel_rna$best,
+    w_clin = w_clin,
+    w_rna = w_rna,
+    clin_ci = c_clin,
+    rna_ci = c_rna,
+    fused_ci = c_fuse,
+    clin_brier5y = b_clin,
+    rna_brier5y = b_rna,
+    fused_brier5y = b_fuse
+  ))
+
+  message(sprintf("Fold %d | C-index: clin=%.3f rna=%.3f fused=%.3f | Brier5y: clin=%.3f rna=%.3f fused=%.3f",
+                  k, c_clin, c_rna, c_fuse, b_clin, b_rna, b_fuse))
+}
+
+# =========================
+# Statistical comparisons (paired across folds)
+# =========================
+results_cv <- results_cv %>% dplyr::filter(!is.na(fused_ci) & !is.na(clin_ci) & !is.na(rna_ci))
+
+message("\n===== Fold-wise results =====")
+print(results_cv)
+
+# C-index tests
+wilcox_c_fused_vs_clin <- wilcox.test(results_cv$fused_ci, results_cv$clin_ci, paired = TRUE)
+wilcox_c_fused_vs_rna  <- wilcox.test(results_cv$fused_ci, results_cv$rna_ci,  paired = TRUE)
+
+# Brier proxy tests (lower is better)
+wilcox_b_fused_vs_clin <- wilcox.test(results_cv$fused_brier5y, results_cv$clin_brier5y, paired = TRUE)
+wilcox_b_fused_vs_rna  <- wilcox.test(results_cv$fused_brier5y, results_cv$rna_brier5y,  paired = TRUE)
+
+# Effect sizes (mean deltas)
+delta_c_fused_clin <- mean(results_cv$fused_ci - results_cv$clin_ci)
+delta_c_fused_rna  <- mean(results_cv$fused_ci - results_cv$rna_ci)
+
+delta_b_fused_clin <- mean(results_cv$fused_brier5y - results_cv$clin_brier5y)
+delta_b_fused_rna  <- mean(results_cv$fused_brier5y - results_cv$rna_brier5y)
+
+summary_table <- data.frame(
+  Model = c("Clinical", "RNA", "Fused"),
+  Mean_Cindex = c(mean(results_cv$clin_ci), mean(results_cv$rna_ci), mean(results_cv$fused_ci)),
+  SD_Cindex   = c(sd(results_cv$clin_ci),   sd(results_cv$rna_ci),   sd(results_cv$fused_ci)),
+  Mean_Brier5y = c(mean(results_cv$clin_brier5y), mean(results_cv$rna_brier5y), mean(results_cv$fused_brier5y)),
+  SD_Brier5y   = c(sd(results_cv$clin_brier5y),   sd(results_cv$rna_brier5y),   sd(results_cv$fused_brier5y))
+)
+
+message("\n===== Summary (5-fold CV) =====")
+print(summary_table)
+
+message("\n===== Paired Wilcoxon tests (C-index; higher is better) =====")
+print(wilcox_c_fused_vs_clin)
+print(wilcox_c_fused_vs_rna)
+
+message("\nEffect size (mean ΔC): fused - clin = ", round(delta_c_fused_clin, 4),
+        " | fused - rna = ", round(delta_c_fused_rna, 4))
+
+message("\n===== Paired Wilcoxon tests (Brier proxy at 5y; lower is better) =====")
+print(wilcox_b_fused_vs_clin)
+print(wilcox_b_fused_vs_rna)
+
+message("\nEffect size (mean ΔBrier5y): fused - clin = ", round(delta_b_fused_clin, 4),
+        " | fused - rna = ", round(delta_b_fused_rna, 4))
+
+# ---- Save outputs ----
+out_csv <- file.path(DIR_TABLES, "brca_5foldcv_stats_brierproxy.csv")
+write.csv(results_cv, out_csv, row.names = FALSE)
+message("Saved 5-fold CV results to: ", out_csv)
+
+```
+
+```{r visualize_cv_results, message=FALSE, warning=FALSE}
+# =========================
+# Visualizations for BRCA 5-fold CV results
+# Produces and saves:
+#   1) Box+points: C-index across folds (Clin vs RNA vs Fused)
+#   2) Bar: Mean ± SD C-index
+#   3) Box+points: ΔC-index (Fused - Clin, Fused - RNA)
+#   4) Box+points: 5-year Brier proxy across folds (lower is better)
+#
+# Assumes you already have:
+#   - results_cv (fold-wise table)
+#   - summary_table (mean/sd table)
+# Also assumes you have directories:
+#   - DIR_FIGS (e.g., "results/figures")
+# =========================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(scales)
+})
+
+# ---- Safety checks ----
+stopifnot(exists("results_cv"))
+stopifnot(exists("summary_table"))
+
+# ---- Output dir ----
+if (!exists("DIR_FIGS")) {
+  DIR_FIGS <- file.path("results", "figures")
+}
+dir.create(DIR_FIGS, recursive = TRUE, showWarnings = FALSE)
+
+# ---- Labels ----
+model_label <- c(
+  clin_ci = "Clinical",
+  rna_ci = "RNA",
+  fused_ci = "Fused",
+  clin_brier5y = "Clinical",
+  rna_brier5y = "RNA",
+  fused_brier5y = "Fused",
+  delta_clin = "Fused − Clinical",
+  delta_rna  = "Fused − RNA"
+)
+
+# =========================
+# 1) C-index across folds (box + points)
+# =========================
+cindex_df <- results_cv %>%
+  select(fold, clin_ci, rna_ci, fused_ci) %>%
+  pivot_longer(-fold, names_to = "model", values_to = "cindex") %>%
+  mutate(model = factor(model, levels = c("clin_ci", "rna_ci", "fused_ci"),
+                        labels = c("Clinical", "RNA", "Fused")))
+
+p1 <- ggplot(cindex_df, aes(x = model, y = cindex)) +
+  geom_boxplot(width = 0.55, outlier.shape = NA, alpha = 0.25) +
+  geom_point(position = position_jitter(width = 0.06, height = 0),
+             size = 2.5, alpha = 0.85) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "BRCA — Discrimination Across 5 Folds",
+    subtitle = "Harrell's C-index (higher is better)",
+    x = NULL, y = "C-index"
+  ) +
+  coord_cartesian(ylim = c(max(0.45, min(cindex_df$cindex, na.rm = TRUE) - 0.05),
+                           min(0.95, max(cindex_df$cindex, na.rm = TRUE) + 0.05))) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.x = element_text(face = "bold")
+  )
+
+ggsave(filename = file.path(DIR_FIGS, "brca_5fold_cindex_box.png"),
+       plot = p1, width = 8, height = 5, dpi = 300)
+
+# =========================
+# 2) Mean ± SD C-index (bar + error bars)
+# =========================
+sum_ci_df <- summary_table %>%
+  mutate(Model = factor(Model, levels = c("Clinical", "RNA", "Fused")))
+
+p2 <- ggplot(sum_ci_df, aes(x = Model, y = Mean_Cindex)) +
+  geom_col(width = 0.6, alpha = 0.35) +
+  geom_errorbar(aes(ymin = Mean_Cindex - SD_Cindex,
+                    ymax = Mean_Cindex + SD_Cindex),
+                width = 0.15, linewidth = 0.9) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "BRCA — Mean C-index ± SD",
+    subtitle = "5-fold stratified CV",
+    x = NULL, y = "C-index"
+  ) +
+  scale_y_continuous(limits = c(0, 1), labels = number_format(accuracy = 0.01)) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.x = element_text(face = "bold")
+  )
+
+ggsave(filename = file.path(DIR_FIGS, "brca_5fold_cindex_mean_sd.png"),
+       plot = p2, width = 8, height = 5, dpi = 300)
+
+# =========================
+# 3) ΔC-index (Fused − baseline) across folds
+# =========================
+delta_df <- results_cv %>%
+  mutate(
+    delta_clin = fused_ci - clin_ci,
+    delta_rna  = fused_ci - rna_ci
+  ) %>%
+  select(fold, delta_clin, delta_rna) %>%
+  pivot_longer(-fold, names_to = "comparison", values_to = "delta") %>%
+  mutate(comparison = factor(comparison, levels = c("delta_clin", "delta_rna"),
+                             labels = c("Fused − Clinical", "Fused − RNA")))
+
+p3 <- ggplot(delta_df, aes(x = comparison, y = delta)) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.9, alpha = 0.8) +
+  geom_boxplot(width = 0.55, outlier.shape = NA, alpha = 0.25) +
+  geom_point(position = position_jitter(width = 0.06, height = 0),
+             size = 2.5, alpha = 0.85) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "BRCA — Fold-wise Fusion Gain",
+    subtitle = "ΔC-index (Fused minus baseline); above 0 indicates improvement",
+    x = NULL, y = "ΔC-index"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.x = element_text(face = "bold")
+  )
+
+ggsave(filename = file.path(DIR_FIGS, "brca_5fold_delta_cindex_box.png"),
+       plot = p3, width = 8, height = 5, dpi = 300)
+
+# =========================
+# 4) 5-year Brier proxy across folds (box + points)
+# =========================
+brier_df <- results_cv %>%
+  select(fold, clin_brier5y, rna_brier5y, fused_brier5y) %>%
+  pivot_longer(-fold, names_to = "model", values_to = "brier") %>%
+  mutate(model = factor(model, levels = c("clin_brier5y", "rna_brier5y", "fused_brier5y"),
+                        labels = c("Clinical", "RNA", "Fused")))
+
+p4 <- ggplot(brier_df, aes(x = model, y = brier)) +
+  geom_boxplot(width = 0.55, outlier.shape = NA, alpha = 0.25) +
+  geom_point(position = position_jitter(width = 0.06, height = 0),
+             size = 2.5, alpha = 0.85) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "BRCA — Calibration Proxy at 5 Years",
+    subtitle = "Brier-style score (lower is better; proxy, not IPCW IBS)",
+    x = NULL, y = "Brier (5y)"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.x = element_text(face = "bold")
+  )
+
+ggsave(filename = file.path(DIR_FIGS, "brca_5fold_brier5y_box.png"),
+       plot = p4, width = 8, height = 5, dpi = 300)
+
+message("Saved figures to: ", normalizePath(DIR_FIGS))
+```
+
