@@ -47,3 +47,21 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# =========================
+# Project-specific (BRCA AZ-AI replication)
+# =========================
+
+# Do NOT commit raw or processed TCGA data
+data/
+
+# Do not commit large R objects
+*.rds
+*.RDS
+
+# Optional: ignore intermediate outputs
+results/tmp/
+results/cache/
+
+# OS files
+.DS_Store
